@@ -33,7 +33,7 @@ pip install vk_api pyTelegramBotAPI
 
 ---
 ## ⚙️ Конфигурация
-Откройте `script.py` и замените переменные своими значениями:
+Откройте `main.py` и замените переменные своими значениями:
 ```python
 VK_TOKEN = "your_vk_token"  # Токен VK
 VK_GROUP_ID = "your_vk_group_id"  # ID группы VK (без "-")
