@@ -44,7 +44,7 @@ TG_CHAT_ID = "your_telegram_chat_id"  # ID чата Telegram
 ---
 ## ▶️ Запуск бота
 ```sh
-python script.py
+python main.py
 ```
 
 Бот начнёт работать и проверять новые посты каждые **10 минут**.
