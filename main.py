@@ -3,6 +3,7 @@ import telebot
 import time
 import json
 import os
+import re
 
 # 🔧 Настройки
 VK_TOKEN = "your_vk_token"  # Токен VK
@@ -11,10 +12,15 @@ TG_BOT_TOKEN = "your_telegram_bot_token"  # Токен бота Telegram
 TG_CHAT_ID = "your_telegram_chat_id"  # ID чата Telegram
 
 LOG_FILE = "log.txt"  # Файл логов
-LAST_POST_FILE = "last_post.json"  # Файл для хранения ID последнего поста
+LAST_POST_FILE = "last_post.json"  # Файл хранения ID последнего поста
 
-# Интервал проверки (в секундах) – 10-15 минут
-CHECK_INTERVAL = 10 * 60  # 10 минут
+# Интервал проверки (10 минут)
+CHECK_INTERVAL = 10 * 60  
+
+# Словарь ссылок для замены
+VK_LINKS = {
+    "club30602036": "https://vk.com/igm"
+}
 
 # Инициализация API
 vk_session = vk_api.VkApi(token=VK_TOKEN)
@@ -42,6 +48,20 @@ def save_last_post_id(post_id):
     with open(LAST_POST_FILE, "w") as file:
         json.dump({"last_post_id": post_id}, file)
 
+def format_vk_text(text):
+    """Заменяет [clubID|Название] на HTML-гиперссылку."""
+    pattern = r"\[club(\d+)\|(.*?)\]"
+    
+    def replace_match(match):
+        club_id, name = match.groups()
+        url = VK_LINKS.get(f"club{club_id}", f"https://vk.com/club{club_id}")
+        return f'<a href="{url}">{name}</a>'
+
+    formatted_text = re.sub(pattern, replace_match, text)
+
+    return formatted_text
+
+
 def get_latest_post():
     """Получает последний пост из VK, пропуская закрепленные."""
     try:
@@ -52,6 +72,7 @@ def get_latest_post():
 
             post_id = post["id"]
             text = post.get("text", "")
+            text = format_vk_text(text)  # Форматируем ссылки VK
 
             # Собираем фото
             photos = []
@@ -75,21 +96,34 @@ def send_to_telegram():
         return
 
     try:
-        # Сначала отправляем текст (если есть)
-        if text:
-            bot.send_message(TG_CHAT_ID, text)
-            log_message("✅ Текст отправлен")
-
-        # Затем отправляем фото (если есть)
-        if photos:
-            media_group = [telebot.types.InputMediaPhoto(photo) for photo in photos]
+        # 1️⃣ Пробуем отправить текст + фото в одном сообщении
+        if text and photos:
+            media_group = [telebot.types.InputMediaPhoto(photo, caption=text if i == 0 else "") for i, photo in enumerate(photos)]
             bot.send_media_group(TG_CHAT_ID, media_group)
-            log_message("✅ Фото отправлены")
+            log_message("✅ Текст и фото отправлены вместе")
+        
+        else:
+            raise ValueError("Текст или фото отсутствуют")  # Принудительный переход к раздельной отправке
 
-        log_message(f"✅ Отправлен пост {post_id}")
-        save_last_post_id(post_id)
     except Exception as e:
-        log_message(f"❌ Ошибка отправки в Telegram: {e}")
+        log_message(f"⚠️ Ошибка при отправке текста + фото вместе: {e}")
+
+        # 2️⃣ Если не получилось, отправляем текст отдельно
+        try:
+            if text:
+                bot.send_message(TG_CHAT_ID, text, parse_mode="Markdown")
+                log_message("✅ Текст отправлен отдельно")
+
+            # 3️⃣ Затем отправляем фото отдельно
+            if photos:
+                media_group = [telebot.types.InputMediaPhoto(photo) for photo in photos]
+                bot.send_media_group(TG_CHAT_ID, media_group)
+                log_message("✅ Фото отправлены отдельно")
+
+        except Exception as e:
+            log_message(f"❌ Ошибка при раздельной отправке: {e}")
+
+    save_last_post_id(post_id)
 
 if __name__ == "__main__":
     log_message("🚀 Бот запущен!")
