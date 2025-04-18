@@ -1,4 +1,4 @@
-# VK to Telegram Bot
+# VK to Telegram Bot. we are planning to add the cobalt api (video forwarding)
 
 Этот бот автоматически переносит новые посты из сообщества VK в Telegram-чат.
 
