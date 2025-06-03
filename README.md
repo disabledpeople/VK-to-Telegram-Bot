@@ -67,34 +67,6 @@ python vk_to_telegram.py
 - Telegram-бот с правом публикации в канале
 - VK API токен с доступом к `wall.get`
 
-## 📄 Лицензия
-
-Проект распространяется под лицензией MIT. См. файл `LICENSE` для подробностей.
-```
-
----
-
-## 🧾 `requirements.txt`
-
-```txt
-vk_api
-pyTelegramBotAPI
-```
-
----
-
-## ⚙️ `.gitignore`
-
-```gitignore
-*.pyc
-__pycache__/
-bot.log
-last_post.json
-config.ini
-.env
-```
-
----
 
 ## 🧪 `config.ini` (пример)
 
