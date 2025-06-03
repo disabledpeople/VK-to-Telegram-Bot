@@ -20,13 +20,13 @@
 
 ### 1. Установите зависимости
 
-```
+```bash
 pip install -r requirements.txt
 ```
 
 ### 2. Создайте файл `config.ini`
 
-```
+```ini
 [VK]
 token = ваш_токен_VK
 group_id = ID_группы_без_минуса
