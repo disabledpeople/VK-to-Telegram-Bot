@@ -1,6 +1,3 @@
-## 📝 `README.md`
-
-```markdown
 # 🤖 VK to Telegram Bot
 
 Автоматический бот для пересылки новых постов из группы **ВКонтакте** в канал **Telegram**.
@@ -67,22 +64,6 @@ python vk_to_telegram.py
 - Telegram-бот с правом публикации в канале
 - VK API токен с доступом к `wall.get`
 
+## 📄 Лицензия
 
-## 🧪 `config.ini` (пример)
-
-```ini
-[VK]
-token = vk1.a.your_vk_token_here
-group_id = 123456789
-
-[TELEGRAM]
-bot_token = 123456:ABC-your-telegram-bot-token
-chat_id = @your_channel_or_chat_id
-
-[SETTINGS]
-check_interval = 600
-
-[VK_LINKS]
-club12345 = https://vk.com/example
-club67890 = https://vk.com/another_group
-```
+Проект распространяется под лицензией MIT. См. файл `LICENSE` для подробностей.
