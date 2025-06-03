@@ -1,133 +1,232 @@
-import vk_api
-import telebot
-import time
-import json
 import os
 import re
+import json
+import time
+import logging
+import configparser
+import vk_api
+import telebot
+import sys
+from logging.handlers import RotatingFileHandler
+from functools import wraps
 
-# 🔧 Настройки
-VK_TOKEN = "your_vk_token"  # Токен VK
-VK_GROUP_ID = "your_vk_group_id"  # ID группы без "-"
-TG_BOT_TOKEN = "your_telegram_bot_token"  # Токен бота Telegram
-TG_CHAT_ID = "your_telegram_chat_id"  # ID чата Telegram
+# Переопределяем стандартный вывод для поддержки UTF-8 (необходимо для Windows)
+sys.stdout.reconfigure(encoding='utf-8')
 
-LOG_FILE = "log.txt"  # Файл логов
-LAST_POST_FILE = "last_post.json"  # Файл хранения ID последнего поста
+##################################
+# Чтение конфигурации из файла
+##################################
+CONFIG_FILE = "config.ini"
 
-# Интервал проверки (10 минут)
-CHECK_INTERVAL = 10 * 60  
+def load_config(config_file=CONFIG_FILE):
+    config = configparser.ConfigParser()
+    if not os.path.exists(config_file):
+        raise FileNotFoundError(f"Конфигурационный файл {config_file} не найден.")
+    config.read(config_file, encoding="utf-8")
+    return config
 
-# Словарь ссылок для замены
-VK_LINKS = {
-    "club30602036": "https://vk.com/igm"
-}
+config = load_config()
 
-# Инициализация API
+# Из секций конфигурации
+VK_TOKEN = config.get("VK", "token")
+VK_GROUP_ID = config.get("VK", "group_id")
+TG_BOT_TOKEN = config.get("TELEGRAM", "bot_token").strip()
+print("Читаемый токен:", repr(TG_BOT_TOKEN))
+TG_CHAT_ID = config.get("TELEGRAM", "chat_id")
+CHECK_INTERVAL = config.getint("SETTINGS", "check_interval", fallback=600)
+
+# Словарь замен ссылок, если задан в секции [VK_LINKS]
+VK_LINKS = dict(config.items("VK_LINKS")) if config.has_section("VK_LINKS") else {}
+
+##################################
+# Настройка логирования с ротацией
+##################################
+logger = logging.getLogger("vk_tg_bot")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler("bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# Файл для хранения последнего ID поста
+LAST_POST_FILE = "last_post.json"
+
+##################################
+# Декоратор для повторных попыток (retry)
+##################################
+def retry(max_attempts=3, delay=5):
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            attempts = 0
+            while attempts < max_attempts:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    attempts += 1
+                    logger.warning("Ошибка в функции %s. Попытка %d/%d. Ошибка: %s",
+                                   func.__name__, attempts, max_attempts, e)
+                    time.sleep(delay)
+            raise Exception(f"{func.__name__} не смогла выполниться после {max_attempts} попыток.")
+        return wrapped
+    return decorator
+
+##################################
+# Инициализация API: VK и Telegram
+##################################
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 bot = telebot.TeleBot(TG_BOT_TOKEN)
 
-def log_message(message):
-    """Записывает сообщение в лог-файл."""
-    with open(LOG_FILE, "a", encoding="utf-8") as log_file:
-        log_file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
-    print(message)
-
+##################################
+# Функции для работы с файлом последнего поста
+##################################
 def load_last_post_id():
-    """Загружает ID последнего отправленного поста."""
     if os.path.exists(LAST_POST_FILE):
-        with open(LAST_POST_FILE, "r") as file:
-            try:
-                return json.load(file).get("last_post_id")
-            except json.JSONDecodeError:
-                return None
+        try:
+            with open(LAST_POST_FILE, "r", encoding="utf-8") as file:
+                data = json.load(file)
+                return data.get("last_post_id")
+        except json.JSONDecodeError:
+            logger.error("Ошибка декодирования JSON в файле последнего поста.")
+            return None
     return None
 
 def save_last_post_id(post_id):
-    """Сохраняет ID последнего отправленного поста."""
-    with open(LAST_POST_FILE, "w") as file:
-        json.dump({"last_post_id": post_id}, file)
+    try:
+        with open(LAST_POST_FILE, "w", encoding="utf-8") as file:
+            json.dump({"last_post_id": post_id}, file)
+    except Exception as e:
+        logger.error("Ошибка сохранения последнего поста: %s", e)
 
-def format_vk_text(text):
-    """Заменяет [clubID|Название] на HTML-гиперссылку."""
+##################################
+# Функция форматирования текста VK
+##################################
+def format_vk_text(text: str) -> str:
+    # Используем raw-строку для регулярного выражения
     pattern = r"\[club(\d+)\|(.*?)\]"
     
-    def replace_match(match):
+    def repl(match):
         club_id, name = match.groups()
         url = VK_LINKS.get(f"club{club_id}", f"https://vk.com/club{club_id}")
         return f'<a href="{url}">{name}</a>'
+    
+    return re.sub(pattern, repl, text)
 
-    formatted_text = re.sub(pattern, replace_match, text)
+##################################
+# Обработка вложений поста VK
+##################################
+def process_attachments(attachments):
+    """
+    Разбиваем вложения поста по типам:
+      - photos: список URL фотографий (изображение максимального качества)
+      - videos: список URL видео (из поля 'player')
+      - docs: список URL документов
+    """
+    photos = []
+    videos = []
+    docs = []
+    for att in attachments:
+        att_type = att.get("type")
+        if att_type == "photo":
+            sizes = att["photo"].get("sizes", [])
+            if sizes:
+                best_photo = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
+                photos.append(best_photo.get("url"))
+        elif att_type == "video":
+            video = att.get("video", {})
+            video_url = video.get("player")
+            if video_url:
+                videos.append(video_url)
+        elif att_type == "doc":
+            doc = att.get("doc", {})
+            doc_url = doc.get("url")
+            if doc_url:
+                docs.append(doc_url)
+        # Можно добавить обработку других типов вложений
+    return photos, videos, docs
 
-    return formatted_text
-
-
+##################################
+# Получение последнего поста VK (без закрепленных)
+##################################
+@retry(max_attempts=3, delay=3)
 def get_latest_post():
-    """Получает последний пост из VK, пропуская закрепленные."""
-    try:
-        posts = vk.wall.get(owner_id=-int(VK_GROUP_ID), count=5)["items"]
-        for post in posts:
-            if post.get("is_pinned"):  # Пропускаем закрепленный пост
-                continue
+    response = vk.wall.get(owner_id=-int(VK_GROUP_ID), count=5)
+    posts = response.get("items", [])
+    for post in posts:
+        if post.get("is_pinned"):
+            continue  # Пропускаем закреплённый пост
+        post_id = post.get("id")
+        text = format_vk_text(post.get("text", ""))
+        attachments = post.get("attachments", [])
+        photos, videos, docs = process_attachments(attachments)
+        return post_id, text, photos, videos, docs
+    return None, None, [], [], []
 
-            post_id = post["id"]
-            text = post.get("text", "")
-            text = format_vk_text(text)  # Форматируем ссылки VK
-
-            # Собираем фото
-            photos = []
-            attachments = post.get("attachments", [])
-            for att in attachments:
-                if att["type"] == "photo":
-                    photos.append(att["photo"]["sizes"][-1]["url"])
-
-            return post_id, text, photos
-    except Exception as e:
-        log_message(f"Ошибка получения поста: {e}")
-    return None, None, None
-
+##################################
+# Отправка сообщения в Telegram
+##################################
 def send_to_telegram():
-    """Отправляет новый пост в Telegram."""
     last_post_id = load_last_post_id()
-    post_id, text, photos = get_latest_post()
-
+    post_id, text, photos, videos, docs = get_latest_post()
+    
     if not post_id or post_id == last_post_id:
-        log_message("Новых постов нет.")
+        logger.info("Новых постов нет.")
         return
-
+    
     try:
-        # 1️⃣ Пробуем отправить текст + фото в одном сообщении
-        if text and photos:
-            media_group = [telebot.types.InputMediaPhoto(photo, caption=text if i == 0 else "") for i, photo in enumerate(photos)]
+        # Отправляем фотографии медиагруппой, если имеются
+        if photos:
+            media_group = []
+            for i, photo in enumerate(photos):
+                # К первому фото добавляем подпись (если есть текст)
+                caption = text if (i == 0 and text) else ""
+                media_group.append(telebot.types.InputMediaPhoto(photo, caption=caption))
             bot.send_media_group(TG_CHAT_ID, media_group)
-            log_message("✅ Текст и фото отправлены вместе")
+            logger.info("✅ Фотографии (и, возможно, текст) отправлены медиагруппой.")
+        elif text:
+            # Если фотографий нет – отправляем текст отдельным сообщением
+            bot.send_message(TG_CHAT_ID, text, parse_mode="HTML")
+            logger.info("✅ Текст отправлен отдельно.")
         
-        else:
-            raise ValueError("Текст или фото отсутствуют")  # Принудительный переход к раздельной отправке
-
-    except Exception as e:
-        log_message(f"⚠️ Ошибка при отправке текста + фото вместе: {e}")
-
-        # 2️⃣ Если не получилось, отправляем текст отдельно
-        try:
-            if text:
-                bot.send_message(TG_CHAT_ID, text, parse_mode="Markdown")
-                log_message("✅ Текст отправлен отдельно")
-
-            # 3️⃣ Затем отправляем фото отдельно
-            if photos:
-                media_group = [telebot.types.InputMediaPhoto(photo) for photo in photos]
-                bot.send_media_group(TG_CHAT_ID, media_group)
-                log_message("✅ Фото отправлены отдельно")
-
-        except Exception as e:
-            log_message(f"❌ Ошибка при раздельной отправке: {e}")
-
+        # Отправляем видео, если они есть
+        for video_url in videos:
+            try:
+                bot.send_video(TG_CHAT_ID, video=video_url,
+                               caption=text if not photos else "", parse_mode="HTML")
+                logger.info("✅ Видео отправлено: %s", video_url)
+            except Exception as e:
+                logger.warning("Не удалось отправить видео %s: %s", video_url, e)
+        
+        # Отправляем документы, если имеются (в виде ссылок)
+        for doc_url in docs:
+            try:
+                message = f"Документ: <a href='{doc_url}'>Ссылка</a>"
+                bot.send_message(TG_CHAT_ID, message, parse_mode="HTML")
+                logger.info("✅ Документ отправлен: %s", doc_url)
+            except Exception as e:
+                logger.warning("Не удалось отправить документ %s: %s", doc_url, e)
+    except Exception as exc:
+        logger.exception("❌ Фатальная ошибка при отправке сообщения: %s", exc)
+    
     save_last_post_id(post_id)
 
-if __name__ == "__main__":
-    log_message("🚀 Бот запущен!")
+##################################
+# Основной цикл работы бота
+##################################
+def main():
+    logger.info("🚀 Бот запущен!")
     while True:
-        send_to_telegram()
-        log_message(f"⌛ Ожидание {CHECK_INTERVAL // 60} минут...")
+        try:
+            send_to_telegram()
+        except Exception as err:
+            logger.exception("Ошибка в основном цикле: %s", err)
+        logger.info("⌛ Ожидание %d минут...", CHECK_INTERVAL // 60)
         time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    main()
