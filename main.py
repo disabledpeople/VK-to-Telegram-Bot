@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -10,13 +11,10 @@ import sys
 from logging.handlers import RotatingFileHandler
 from functools import wraps
 
-# Переопределяем стандартный вывод для поддержки UTF-8 (необходимо для Windows)
 sys.stdout.reconfigure(encoding='utf-8')
 
-##################################
-# Чтение конфигурации из файла
-##################################
 CONFIG_FILE = "config.ini"
+LAST_POST_FILE = "sent_posts.json"
 
 def load_config(config_file=CONFIG_FILE):
     config = configparser.ConfigParser()
@@ -26,38 +24,53 @@ def load_config(config_file=CONFIG_FILE):
     return config
 
 config = load_config()
+POST_STATUS_FILE = "post_status.json"
 
-# Из секций конфигурации
+def load_post_status():
+    if os.path.exists(POST_STATUS_FILE):
+        try:
+            with open(POST_STATUS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            logger.error("Ошибка загрузки post_status.json")
+    return {}
+
+def save_post_status(post_id, success):
+    status = load_post_status()
+    status[str(post_id)] = {"sent": success, "timestamp": time.time()}
+    try:
+        with open(POST_STATUS_FILE, "w", encoding="utf-8") as f:
+            json.dump(status, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения статуса поста {post_id}: {e}")
+
 VK_TOKEN = config.get("VK", "token")
 VK_GROUP_ID = config.get("VK", "group_id")
 TG_BOT_TOKEN = config.get("TELEGRAM", "bot_token").strip()
-print("Читаемый токен:", repr(TG_BOT_TOKEN))
 TG_CHAT_ID = config.get("TELEGRAM", "chat_id")
 CHECK_INTERVAL = config.getint("SETTINGS", "check_interval", fallback=600)
-
-# Словарь замен ссылок, если задан в секции [VK_LINKS]
+DRY_RUN = config.getboolean("SETTINGS", "dry_run", fallback=False)
+ADMIN_CHAT_ID = config.get("TELEGRAM", "admin_chat_id")
+BOT_NAME = config.get("TELEGRMA", "bot_name")
 VK_LINKS = dict(config.items("VK_LINKS")) if config.has_section("VK_LINKS") else {}
 
-##################################
-# Настройка логирования с ротацией
-##################################
+# Логирование
 logger = logging.getLogger("vk_tg_bot")
 logger.setLevel(logging.INFO)
 handler = RotatingFileHandler("bot.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8")
 formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
 handler.setFormatter(formatter)
 logger.addHandler(handler)
-
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# Файл для хранения последнего ID поста
-LAST_POST_FILE = "last_post.json"
+# Инициализация API
+vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk = vk_session.get_api()
+bot = telebot.TeleBot(TG_BOT_TOKEN, parse_mode="HTML")
 
-##################################
-# Декоратор для повторных попыток (retry)
-##################################
+# Retry-декоратор
 def retry(max_attempts=3, delay=5):
     def decorator(func):
         @wraps(func)
@@ -75,61 +88,18 @@ def retry(max_attempts=3, delay=5):
         return wrapped
     return decorator
 
-##################################
-# Инициализация API: VK и Telegram
-##################################
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-bot = telebot.TeleBot(TG_BOT_TOKEN)
-
-##################################
-# Функции для работы с файлом последнего поста
-##################################
-def load_last_post_id():
-    if os.path.exists(LAST_POST_FILE):
-        try:
-            with open(LAST_POST_FILE, "r", encoding="utf-8") as file:
-                data = json.load(file)
-                return data.get("last_post_id")
-        except json.JSONDecodeError:
-            logger.error("Ошибка декодирования JSON в файле последнего поста.")
-            return None
-    return None
-
-def save_last_post_id(post_id):
-    try:
-        with open(LAST_POST_FILE, "w", encoding="utf-8") as file:
-            json.dump({"last_post_id": post_id}, file)
-    except Exception as e:
-        logger.error("Ошибка сохранения последнего поста: %s", e)
-
-##################################
-# Функция форматирования текста VK
-##################################
+# Обработка текста с гиперссылками
 def format_vk_text(text: str) -> str:
-    # Используем raw-строку для регулярного выражения
     pattern = r"\[club(\d+)\|(.*?)\]"
-    
     def repl(match):
         club_id, name = match.groups()
         url = VK_LINKS.get(f"club{club_id}", f"https://vk.com/club{club_id}")
         return f'<a href="{url}">{name}</a>'
-    
     return re.sub(pattern, repl, text)
 
-##################################
-# Обработка вложений поста VK
-##################################
+# Обработка вложений
 def process_attachments(attachments):
-    """
-    Разбиваем вложения поста по типам:
-      - photos: список URL фотографий (изображение максимального качества)
-      - videos: список URL видео (из поля 'player')
-      - docs: список URL документов
-    """
-    photos = []
-    videos = []
-    docs = []
+    photos, videos, docs = [], [], []
     for att in attachments:
         att_type = att.get("type")
         if att_type == "photo":
@@ -138,95 +108,196 @@ def process_attachments(attachments):
                 best_photo = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
                 photos.append(best_photo.get("url"))
         elif att_type == "video":
-            video = att.get("video", {})
-            video_url = video.get("player")
-            if video_url:
-                videos.append(video_url)
+            player = att.get("video", {}).get("player")
+            if player:
+                videos.append(player)
         elif att_type == "doc":
-            doc = att.get("doc", {})
-            doc_url = doc.get("url")
-            if doc_url:
-                docs.append(doc_url)
-        # Можно добавить обработку других типов вложений
+            url = att.get("doc", {}).get("url")
+            if url:
+                docs.append(url)
     return photos, videos, docs
 
-##################################
-# Получение последнего поста VK (без закрепленных)
-##################################
+# Хранение отправленных постов
+SENT_POSTS = set()
+if os.path.exists(LAST_POST_FILE):
+    try:
+        with open(LAST_POST_FILE, "r", encoding="utf-8") as file:
+            SENT_POSTS = set(json.load(file))
+    except Exception as e:
+        logger.warning("Не удалось загрузить файл отправленных постов: %s", e)
+
+def save_sent_posts():
+    try:
+        with open(LAST_POST_FILE, "w", encoding="utf-8") as file:
+            json.dump(list(SENT_POSTS), file, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning("Не удалось сохранить отправленные посты: %s", e)
+
+# Уведомление в Telegram об ошибке
+def notify_admin(text: str):
+    try:
+        bot.send_message(TG_CHAT_ID, text, parse_mode="HTML")
+    except Exception as e:
+        logger.error("Не удалось отправить сообщение об ошибке в Telegram: %s", e)
+
 @retry(max_attempts=3, delay=3)
 def get_latest_post():
     response = vk.wall.get(owner_id=-int(VK_GROUP_ID), count=5)
     posts = response.get("items", [])
     for post in posts:
         if post.get("is_pinned"):
-            continue  # Пропускаем закреплённый пост
+            continue  # пропускаем закреплённый
         post_id = post.get("id")
+        text = format_vk_text(post.get("text", ""))
+        photos, videos, docs = process_attachments(post.get("attachments", []))
+        return {
+            "id": post_id,
+            "text": text,
+            "photos": photos,
+            "videos": videos,
+            "docs": docs
+        }
+    return None
+
+@bot.message_handler(commands=['force_check'])
+def handle_force_check(message):
+    if message.text and f'{BOT_NAME}' in message.text:
+        logger.info(f"Принудительный запрос поста от пользователя {message.from_user.id}")
+        try:
+            post = get_latest_post()
+            if not post:
+                bot.reply_to(message, "Нет новых постов для отправки.")
+                return
+
+            # Загрузка статусов постов
+            status = load_post_status()
+            post_id_str = str(post["id"])
+
+            if status.get(post_id_str, {}).get("sent"):
+                bot.reply_to(message, f"Пост ID {post['id']} уже был отправлен ранее.")
+                return
+
+            sent = check_and_send_post(post)
+            if sent:
+                save_post_status(post["id"], True)
+                bot.reply_to(message, f"Пост ID {post['id']} успешно отправлен.")
+            else:
+                save_post_status(post["id"], False)
+                bot.reply_to(message, f"Пост ID {post['id']} не был отправлен.")
+        except Exception as e:
+            logger.exception(f"Ошибка при обработке /force_check: {e}")
+            bot.reply_to(message, f"Произошла ошибка: {e}")
+    else:
+        bot.reply_to(message, "Пожалуйста, используйте команду с полным упоминанием бота /force_check@имя_бота).")
+
+
+# Получение новых постов
+@retry()
+def get_all_new_posts():
+    response = vk.wall.get(owner_id=-int(VK_GROUP_ID), count=5)
+    posts = response.get("items", [])
+    new_posts = []
+    for post in reversed(posts):  # от старого к новому
+        if post.get("is_pinned"):
+            continue
+        post_id = post.get("id")
+        if post_id in SENT_POSTS:
+            continue
         text = format_vk_text(post.get("text", ""))
         attachments = post.get("attachments", [])
         photos, videos, docs = process_attachments(attachments)
-        return post_id, text, photos, videos, docs
-    return None, None, [], [], []
+        new_posts.append({
+            "id": post_id,
+            "text": text,
+            "photos": photos,
+            "videos": videos,
+            "docs": docs
+        })
+    return new_posts
 
-##################################
-# Отправка сообщения в Telegram
-##################################
-def send_to_telegram():
-    last_post_id = load_last_post_id()
-    post_id, text, photos, videos, docs = get_latest_post()
-    
-    if not post_id or post_id == last_post_id:
-        logger.info("Новых постов нет.")
-        return
-    
+def check_and_send_post(post):
+    post_id = post["id"]
+    text = post["text"]
+    photos = post.get("photos", [])
+    videos = post.get("videos", [])
+    docs = post.get("docs", [])
+
+    logger.info(f"Обработка поста ID {post_id}")
+
+    if DRY_RUN:
+        logger.info(f"[dry-run] Пост ID {post_id} будет отправлен с текстом длиной {len(text)} символов, "
+                    f"{len(photos)} фото, {len(videos)} видео, {len(docs)} документов.")
+        return True
+
     try:
-        # Отправляем фотографии медиагруппой, если имеются
+        # Отправка фотографий медиагруппой
         if photos:
             media_group = []
-            for i, photo in enumerate(photos):
-                # К первому фото добавляем подпись (если есть текст)
-                caption = text if (i == 0 and text) else ""
-                media_group.append(telebot.types.InputMediaPhoto(photo, caption=caption))
+            for i, photo_url in enumerate(photos):
+                # Ограничиваем длину подписи (caption) до 1024 символов (лимит Telegram)
+                caption = text[:1024] if i == 0 and text else ""
+                media_group.append(telebot.types.InputMediaPhoto(media=photo_url, caption=caption))
             bot.send_media_group(TG_CHAT_ID, media_group)
-            logger.info("✅ Фотографии (и, возможно, текст) отправлены медиагруппой.")
+            logger.info(f"✅ Пост ID {post_id}: фотографии отправлены медиагруппой с подписью.")
         elif text:
-            # Если фотографий нет – отправляем текст отдельным сообщением
+            # Если нет фото, отправляем только текст
             bot.send_message(TG_CHAT_ID, text, parse_mode="HTML")
-            logger.info("✅ Текст отправлен отдельно.")
-        
-        # Отправляем видео, если они есть
+            logger.info(f"✅ Пост ID {post_id}: текст отправлен.")
+
+        # Отправка видео по отдельности, если есть
         for video_url in videos:
             try:
-                bot.send_video(TG_CHAT_ID, video=video_url,
-                               caption=text if not photos else "", parse_mode="HTML")
-                logger.info("✅ Видео отправлено: %s", video_url)
+                bot.send_video(TG_CHAT_ID, video=video_url, caption="", parse_mode="HTML")
+                logger.info(f"✅ Пост ID {post_id}: видео отправлено {video_url}")
             except Exception as e:
-                logger.warning("Не удалось отправить видео %s: %s", video_url, e)
-        
-        # Отправляем документы, если имеются (в виде ссылок)
+                logger.warning(f"Не удалось отправить видео {video_url} поста {post_id}: {e}")
+
+        # Отправка документов как ссылки
         for doc_url in docs:
             try:
-                message = f"Документ: <a href='{doc_url}'>Ссылка</a>"
+                message = f"Документ: <a href='{doc_url}'>ссылка</a>"
                 bot.send_message(TG_CHAT_ID, message, parse_mode="HTML")
-                logger.info("✅ Документ отправлен: %s", doc_url)
+                logger.info(f"✅ Пост ID {post_id}: документ отправлен {doc_url}")
             except Exception as e:
-                logger.warning("Не удалось отправить документ %s: %s", doc_url, e)
-    except Exception as exc:
-        logger.exception("❌ Фатальная ошибка при отправке сообщения: %s", exc)
-    
-    save_last_post_id(post_id)
+                logger.warning(f"Не удалось отправить документ {doc_url} поста {post_id}: {e}")
 
-##################################
-# Основной цикл работы бота
-##################################
+        return True
+    except Exception as exc:
+        logger.error(f"❌ Ошибка при отправке поста ID {post_id}: {exc}")
+        # Отправить уведомление в Telegram об ошибке
+        try:
+            bot.send_message(
+                ADMIN_CHAT_ID,
+                f"❌ Ошибка при отправке поста ID {post_id}:\n{exc}",
+                parse_mode="HTML"
+            )
+        except:
+            logger.error("Не удалось отправить уведомление об ошибке в Telegram.")
+        return False
+
+# Основной цикл, где вызывается check_and_send_post
 def main():
-    logger.info("🚀 Бот запущен!")
+    logger.info(f"🚀 Бот запущен. Dry-run: {DRY_RUN}")
     while True:
         try:
-            send_to_telegram()
-        except Exception as err:
-            logger.exception("Ошибка в основном цикле: %s", err)
-        logger.info("⌛ Ожидание %d минут...", CHECK_INTERVAL // 60)
+            latest_post = get_latest_post()  # функция получает последний пост из VK (надо реализовать)
+            if latest_post:
+                sent = check_and_send_post(latest_post)
+                if sent:
+                    save_post_status(latest_post["id"], True)
+                else:
+                    save_post_status(latest_post["id"], False)
+            else:
+                logger.info("Нет новых постов.")
+        except Exception as e:
+            logger.exception(f"Ошибка в основном цикле: {e}")
+            try:
+                bot.send_message(ADMIN_CHAT_ID, f"❌ Фатальная ошибка бота:\n{e}", parse_mode="HTML")
+            except:
+                logger.error("Не удалось отправить уведомление об ошибке в Telegram.")
+        logger.info(f"⌛ Ожидание {CHECK_INTERVAL} секунд...")
         time.sleep(CHECK_INTERVAL)
 
 if __name__ == "__main__":
+    bot.polling(none_stop=True)
     main()
